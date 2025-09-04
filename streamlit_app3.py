@@ -1,3 +1,4 @@
+# son guncel calısan github
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -60,6 +61,146 @@ class SimplePubMedSearcher:
             time.sleep(self.delay - time_since_last)
         self.last_request = time.time()
     
+def generate_heart_df(n_samples=1000, seed=42, add_missing=True):
+    rng = np.random.default_rng(seed)
+
+    # --- Age & Sex ---
+    age = rng.integers(25, 81, size=n_samples)
+    # 0=female, 1=male (birçok klinik veri setinde erkek oranı daha yüksek görülür)
+    sex = rng.choice([0, 1], size=n_samples, p=[0.35, 0.65])
+
+    # --- Blood pressure (mmHg) ---
+    # Temel: yaş + cinsiyet etkisi + gürültü
+    sbp_mu = 110 + 0.6*age + 5*sex
+    resting_blood_pressure = np.clip(np.round(rng.normal(sbp_mu, 12)), 85, 220).astype(int)
+
+    # --- Serum cholesterol (mg/dL) ---
+    chol_mu = 170 + 0.9*age + 10*sex
+    serum_cholesterol = np.clip(np.round(rng.normal(chol_mu, 35)), 100, 400).astype(int)
+
+    # --- Fasting blood sugar (>120mg/dl: 1) ---
+    # Yaş ve kolesterolle ılımlı ilişki
+    fbs_p = 1/(1 + np.exp(-(-5 + 0.03*age + 0.005*(serum_cholesterol-200))))
+    fasting_blood_sugar = rng.binomial(1, fbs_p)
+
+    # --- Resting ECG (0: normal, 1: ST-T anorm., 2: sol VH) ---
+    # Hipertansiyon ve yaş ECG anormallik olasılığını artırır
+    ecg_p1 = np.clip(0.15 + 0.003*(resting_blood_pressure-120) + 0.002*(age-50), 0, 0.6)
+    ecg_p2 = np.clip(0.03 + 0.002*(resting_blood_pressure-130), 0, 0.2)
+    ecg_p0 = np.clip(1 - ecg_p1 - ecg_p2, 0.05, 1)
+    probs = np.vstack([ecg_p0, ecg_p1, ecg_p2]).T
+    probs = probs / probs.sum(1, keepdims=True)
+    resting_ecg_results = np.array([rng.choice([0,1,2], p=p) for p in probs])
+
+    # --- Chest pain type (0:typical angina,1:atypical,2:non-anginal,3:asymptomatic) ---
+    # Hastalık riski arttıkça 3 (asemptomatik) ve 0 (tipik) biraz daha olası
+    base_cpt = np.array([0.30, 0.20, 0.35, 0.15])
+    chest_pain_type = rng.choice([0,1,2,3], size=n_samples, p=base_cpt)
+
+    # --- Max heart rate achieved ---
+    hr_pred = 208 - 0.7*age + rng.normal(0, 10, n_samples)
+    max_heart_rate_achieved = np.clip(np.round(hr_pred), 90, 210).astype(int)
+
+    # --- Exercise-induced angina ---
+    # Daha yüksek SBP/kolesterol, daha düşük HR kapasitesi => daha yüksek olasılık
+    angina_logit = -2.0 + 0.01*(resting_blood_pressure-120) + 0.006*(serum_cholesterol-200) - 0.015*(max_heart_rate_achieved-150) + 0.4*(chest_pain_type==0) + 0.3*(chest_pain_type==3)
+    angina_p = 1/(1+np.exp(-angina_logit))
+    exercise_induced_angina = rng.binomial(1, np.clip(angina_p, 0.02, 0.8))
+
+    # --- ST depression (oldpeak) ---
+    st_base = np.maximum(0, rng.normal(0.6 + 0.01*(age-50) + 0.008*(resting_blood_pressure-120), 0.6, n_samples))
+    st_depression = np.round(st_base + 0.8*exercise_induced_angina + 0.3*(resting_ecg_results==1), 1)
+
+    # --- ST slope (0:down,1:flat,2:up) ---
+    # Daha yüksek ST depresyonu -> down/flat olasılığı artar
+    slope_scores = np.clip(st_depression, 0, None)
+    p_down = np.clip(0.05 + 0.10*slope_scores, 0.05, 0.60)
+    p_flat = np.clip(0.30 + 0.10*slope_scores, 0.20, 0.70)
+    p_up = np.clip(1 - p_down - p_flat, 0.05, 0.75)
+    # normalize
+    norm = (p_down + p_flat + p_up)
+    p_down, p_flat, p_up = p_down/norm, p_flat/norm, p_up/norm
+    st_slope = np.array([rng.choice([0,1,2], p=[pdn, pft, pup]) for pdn, pft, pup in zip(p_down, p_flat, p_up)])
+
+    # --- Number of major vessels (0-3) ---
+    # Hastalığı olanlarda 1-3 daha olası
+    vessel_logits = -0.2 + 0.004*(age-50) + 0.003*(serum_cholesterol-200) + 0.25*exercise_induced_angina + 0.15*(st_depression>1.0)
+    vessel_p = 1/(1+np.exp(-vessel_logits))
+    number_of_major_vessels = rng.choice([0,1,2,3], size=n_samples, p=[np.mean(1-vessel_p), np.mean(0.5*vessel_p), np.mean(0.3*vessel_p), np.mean(0.2*vessel_p)])
+
+    # --- Thalassemia type (1=fixed defect, 2=normal, 3=reversible defect) ---
+    # Hastalıkla ilişki: 1 ve 3 bir miktar artar
+    thal = []
+    for i in range(n_samples):
+        if st_depression[i] > 1.0 or exercise_induced_angina[i]==1:
+            thal.append(rng.choice([1,2,3], p=[0.12, 0.25, 0.63]))
+        else:
+            thal.append(rng.choice([1,2,3], p=[0.06, 0.42, 0.52]))
+    thalassemia_type = np.array(thal)
+
+    # --- Disease probability (logistic model) ---
+    logit = (
+        -8.0
+        + 0.045*(age-50)
+        + 0.018*(resting_blood_pressure-120)
+        + 0.012*(serum_cholesterol-200)
+        + 0.6*fasting_blood_sugar
+        + 0.5*exercise_induced_angina
+        + 0.35*(resting_ecg_results==1)
+        + 0.25*(resting_ecg_results==2)
+        + 0.40*(st_depression)          # her 1 birim ↑ risk ↑
+        + 0.45*(st_slope==0)            # downsloping
+        + 0.25*(st_slope==1)            # flat
+        + 0.35*(chest_pain_type==0)     # tipik anjina
+        + 0.20*(chest_pain_type==3)     # asemptomatik
+        + 0.20*sex
+        + 0.30*(number_of_major_vessels>=1)
+        + 0.15*(thalassemia_type==1)
+        + 0.25*(thalassemia_type==3)
+    )
+    p_disease = 1/(1+np.exp(-logit))
+    has_disease = rng.binomial(1, np.clip(p_disease, 0.02, 0.95))
+
+    # Göğüs ağrısı tipinin dağılımını hastalıkla biraz uyumlu hale getir (opsiyonel)
+    # Hastalığı olmayanlarda non-anginal (2) biraz daha sık, hastalığı olanlarda 0 ve 3 biraz artar
+    adjust_mask = rng.random(n_samples) < 0.15
+    chest_pain_type = chest_pain_type.copy()
+    chest_pain_type[(has_disease==0) & adjust_mask] = rng.choice([1,2], size=((has_disease==0) & adjust_mask).sum(), p=[0.35, 0.65])
+    chest_pain_type[(has_disease==1) & adjust_mask] = rng.choice([0,3], size=((has_disease==1) & adjust_mask).sum(), p=[0.55, 0.45])
+
+    # --- küçük oranlarda aykırı değer ve eksik değer ekle (opsiyonel) ---
+    if add_missing:
+        miss_mask = rng.random(n_samples) < 0.02
+        serum_cholesterol = serum_cholesterol.astype('float')
+        serum_cholesterol[miss_mask] = np.nan
+        bp_out_mask = rng.random(n_samples) < 0.01
+        resting_blood_pressure[bp_out_mask] = np.clip(resting_blood_pressure[bp_out_mask] + rng.integers(30, 60, bp_out_mask.sum()), 120, 260)
+
+    heart_df = pd.DataFrame({
+        'age': age,
+        'sex': sex,  # 0=female, 1=male
+        'chest_pain_type': chest_pain_type,
+        'resting_blood_pressure': resting_blood_pressure,
+        'serum_cholesterol': serum_cholesterol,
+        'fasting_blood_sugar': fasting_blood_sugar,  # >120mg/dl
+        'resting_ecg_results': resting_ecg_results,
+        'max_heart_rate_achieved': max_heart_rate_achieved,
+        'exercise_induced_angina': exercise_induced_angina,
+        'st_depression': st_depression,
+        'st_slope': st_slope,
+        'number_of_major_vessels': number_of_major_vessels,
+        'thalassemia_type': thalassemia_type,
+        'has_disease': has_disease,
+        'disease_prob': p_disease.round(3)
+    })
+
+    # Türleri düzelt
+    int_cols = ['age','sex','chest_pain_type','resting_blood_pressure','fasting_blood_sugar',
+                'resting_ecg_results','max_heart_rate_achieved','exercise_induced_angina',
+                'st_slope','number_of_major_vessels','thalassemia_type','has_disease']
+    heart_df[int_cols] = heart_df[int_cols].astype(int)
+
+    return heart_df
     def fetch_article_details(self, pmids: List[str]) -> List[dict]:
         """Fetch article details from PubMed IDs"""
         if not pmids:
@@ -1356,53 +1497,11 @@ def main():
                 st.success("✅ Sample data ready for download!")
         
         with col2:
-            if st.button("❤️ Load Heart Disease Dataset"):
+            if st.button("❤️ Load Heart Disease Dataset!"):
                 try:
                     # Create a synthetic heart disease dataset
-                    np.random.seed(42)
-                    n_samples = 1000
-                    
-                    # Generate realistic heart disease features
-                    heart_df = pd.DataFrame({
-                        'age': np.random.randint(25, 80, n_samples),
-                        'sex': np.random.choice([0, 1], n_samples, p=[0.32, 0.68]),  # 0=female, 1=male
-                        'chest_pain_type': np.random.choice([0, 1, 2, 3], n_samples, p=[0.47, 0.17, 0.28, 0.08]),
-                        'resting_blood_pressure': np.random.normal(131, 17, n_samples).astype(int),
-                        'serum_cholesterol': np.random.normal(246, 51, n_samples).astype(int),
-                        'fasting_blood_sugar': np.random.choice([0, 1], n_samples, p=[0.85, 0.15]),  # >120mg/dl
-                        'resting_ecg_results': np.random.choice([0, 1, 2], n_samples, p=[0.48, 0.48, 0.04]),
-                        'max_heart_rate_achieved': np.random.normal(149, 22, n_samples).astype(int),
-                        'exercise_induced_angina': np.random.choice([0, 1], n_samples, p=[0.67, 0.33]),
-                        'st_depression': np.random.exponential(1.0, n_samples).round(1),
-                        'st_slope': np.random.choice([0, 1, 2], n_samples, p=[0.14, 0.46, 0.40]),
-                        'number_of_major_vessels': np.random.choice([0, 1, 2, 3], n_samples, p=[0.54, 0.21, 0.16, 0.09]),
-                        'thalassemia_type': np.random.choice([1, 2, 3], n_samples, p=[0.05, 0.18, 0.77]),
-                    })
-                    
-                    # Ensure realistic ranges
-                    heart_df['resting_blood_pressure'] = np.clip(heart_df['resting_blood_pressure'], 94, 200)
-                    heart_df['serum_cholesterol'] = np.clip(heart_df['serum_cholesterol'], 126, 564)
-                    heart_df['max_heart_rate_achieved'] = np.clip(heart_df['max_heart_rate_achieved'], 71, 202)
-                    heart_df['st_depression'] = np.clip(heart_df['st_depression'], 0.0, 6.2)
-                    
-                    # Create target variable (0=no disease, 1=disease) with realistic correlations
-                    # Higher risk factors increase probability of heart disease
-                    risk_score = (
-                        (heart_df['age'] - 25) / 55 * 0.3 +
-                        heart_df['sex'] * 0.4 +  # males higher risk
-                        (heart_df['chest_pain_type'] == 0) * 0.3 +  # typical angina
-                        (heart_df['resting_blood_pressure'] - 94) / 106 * 0.2 +
-                        (heart_df['serum_cholesterol'] - 126) / 438 * 0.15 +
-                        heart_df['fasting_blood_sugar'] * 0.1 +
-                        heart_df['exercise_induced_angina'] * 0.4 +
-                        heart_df['st_depression'] / 6.2 * 0.3 +
-                        (heart_df['number_of_major_vessels'] / 3) * 0.5 +
-                        (heart_df['thalassemia_type'] == 3) * 0.2
-                    )
-                    
-                    # Convert risk score to probability and generate target
-                    prob_disease = 1 / (1 + np.exp(-(risk_score - 1.8)))  # sigmoid function
-                    heart_df['target'] = np.random.binomial(1, prob_disease, n_samples)
+
+                    heart_df = generate_heart_df(n_samples=2000, seed=7)
                     
                     csv = heart_df.to_csv(index=False)
                     st.download_button(
