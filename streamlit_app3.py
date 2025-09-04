@@ -1,3 +1,4 @@
+# son guncel calısan github
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -41,9 +42,9 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.model_selection import StratifiedKFold, KFold, cross_val_score
 from sklearn.metrics import get_scorer
 
-# ---- PubMed Integration ----
+# ---- Enhanced PubMed Integration with Article Details ----
 class SimplePubMedSearcher:
-    """Simple PubMed searcher with rate limiting"""
+    """Enhanced PubMed searcher with rate limiting and article fetching"""
     
     def __init__(self, email: str, api_key: Optional[str] = None, delay: float = 0.34):
         self.email = email
@@ -51,18 +52,122 @@ class SimplePubMedSearcher:
         self.delay = delay if not api_key else 0.1  # Faster with API key
         self.last_request = 0
         self.cache = {}
+        self.article_cache = {}  # Cache for article details
+    
+    def _rate_limit(self):
+        """Apply rate limiting between requests"""
+        time_since_last = time.time() - self.last_request
+        if time_since_last < self.delay:
+            time.sleep(self.delay - time_since_last)
+        self.last_request = time.time()
+    
+    def fetch_article_details(self, pmids: List[str]) -> List[dict]:
+        """Fetch article details from PubMed IDs"""
+        if not pmids:
+            return []
+        
+        # Check cache first
+        articles = []
+        pmids_to_fetch = []
+        for pmid in pmids:
+            if pmid in self.article_cache:
+                articles.append(self.article_cache[pmid])
+            else:
+                pmids_to_fetch.append(pmid)
+        
+        if not pmids_to_fetch:
+            return articles
+        
+        self._rate_limit()
+        
+        try:
+            # Fetch article details using efetch
+            fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+            params = {
+                'db': 'pubmed',
+                'id': ','.join(pmids_to_fetch),
+                'retmode': 'xml',
+                'email': self.email,
+                'tool': 'FeatureSelectionAgent'
+            }
+            
+            if self.api_key:
+                params['api_key'] = self.api_key
+            
+            response = requests.get(fetch_url, params=params, timeout=15)
+            root = ET.fromstring(response.content)
+            
+            # Parse each article
+            for article_elem in root.findall('.//PubmedArticle'):
+                article_info = self._parse_article(article_elem)
+                if article_info:
+                    articles.append(article_info)
+                    self.article_cache[article_info['pmid']] = article_info
+            
+        except Exception as e:
+            st.warning(f"Error fetching article details: {str(e)}")
+        
+        return articles
+    
+    def _parse_article(self, article_elem) -> dict:
+        """Parse article XML element"""
+        try:
+            # Extract PMID
+            pmid_elem = article_elem.find('.//PMID')
+            pmid = pmid_elem.text if pmid_elem is not None else "Unknown"
+            
+            # Extract title
+            title_elem = article_elem.find('.//ArticleTitle')
+            title = title_elem.text if title_elem is not None else "No title"
+            
+            # Extract authors
+            authors = []
+            for author in article_elem.findall('.//Author'):
+                last_name = author.find('LastName')
+                fore_name = author.find('ForeName')
+                if last_name is not None:
+                    author_name = last_name.text
+                    if fore_name is not None:
+                        author_name = f"{author_name} {fore_name.text[0]}"
+                    authors.append(author_name)
+            authors_str = ", ".join(authors[:3])
+            if len(authors) > 3:
+                authors_str += " et al."
+            
+            # Extract journal
+            journal_elem = article_elem.find('.//Journal/Title')
+            journal = journal_elem.text if journal_elem is not None else "Unknown Journal"
+            
+            # Extract year
+            year_elem = article_elem.find('.//PubDate/Year')
+            year = year_elem.text if year_elem is not None else "Unknown"
+            
+            # Extract abstract
+            abstract_elem = article_elem.find('.//AbstractText')
+            abstract = abstract_elem.text if abstract_elem is not None else "No abstract available"
+            if len(abstract) > 300:
+                abstract = abstract[:297] + "..."
+            
+            return {
+                'pmid': pmid,
+                'title': title,
+                'authors': authors_str,
+                'journal': journal,
+                'year': year,
+                'abstract': abstract,
+                'url': f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+            }
+        except Exception:
+            return None
     
     def search_simple(self, feature_name: str, disease_context: str = None, max_results: int = 5) -> dict:
-        """Simple PubMed search"""
+        """Enhanced PubMed search with article details"""
         cache_key = f"{feature_name}_{disease_context}_{max_results}"
         if cache_key in self.cache:
             return self.cache[cache_key]
         
         # Rate limiting
-        time_since_last = time.time() - self.last_request
-        if time_since_last < self.delay:
-            time.sleep(self.delay - time_since_last)
-        self.last_request = time.time()
+        self._rate_limit()
         
         try:
             # Build search query
@@ -99,10 +204,14 @@ class SimplePubMedSearcher:
             if disease_context and count > 0:
                 evidence_score *= 1.2  # Bonus for disease context
             
+            # Fetch article details for top results
+            articles = self.fetch_article_details(ids[:5]) if ids else []
+            
             result = {
                 'feature_name': feature_name,
                 'paper_count': count,
-                'sample_ids': ids[:3],
+                'sample_ids': ids[:5],
+                'articles': articles,  # Now includes full article details
                 'evidence_score': round(evidence_score, 1),
                 'search_query': search_term,
                 'disease_context': disease_context
@@ -117,6 +226,7 @@ class SimplePubMedSearcher:
                 'feature_name': feature_name,
                 'paper_count': 0,
                 'sample_ids': [],
+                'articles': [],
                 'evidence_score': 0.0,
                 'search_query': '',
                 'disease_context': disease_context
@@ -615,6 +725,27 @@ def analyze_literature_results(literature_results: List[dict]) -> dict:
     
     return analysis
 
+def display_articles_for_feature(feature_name: str, articles: List[dict]):
+    """Display articles for a specific feature in Streamlit"""
+    if not articles:
+        st.info(f"No articles found for {feature_name}")
+        return
+    
+    st.markdown(f"**📚 Publications for {feature_name}:**")
+    
+    for i, article in enumerate(articles, 1):
+        with st.expander(f"{i}. {article['title'][:100]}..."):
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.markdown(f"**Authors:** {article['authors']}")
+                st.markdown(f"**Journal:** {article['journal']}")
+                st.markdown(f"**Year:** {article['year']}")
+                if article['abstract'] != "No abstract available":
+                    st.markdown(f"**Abstract:** {article['abstract']}")
+            with col2:
+                st.markdown(f"**PMID:** {article['pmid']}")
+                st.markdown(f"[View on PubMed]({article['url']})")
+
 # ---- Streamlit Application ----
 
 def main():
@@ -634,6 +765,7 @@ def main():
     - 📚 **Evidence Scoring**: Features ranked by scientific publication support
     - 🎯 **Literature-Informed Decisions**: Agent adapts strategy based on literature evidence
     - 📈 **Publication Analytics**: Visualize research trends and evidence strength
+    - 📖 **Article Listing**: View actual PubMed articles for each selected feature
     """)
 
     # Sidebar configuration
@@ -874,7 +1006,11 @@ def main():
 
             # Run agent
             try:
-                agent = LiteratureEnhancedAgent(config, pubmed_searcher)
+                agent = LiteratureEnhancedAgent(
+                    config, 
+                    pubmed_searcher, 
+                    disease_context=disease_context if disease_context else None
+                )
                 
                 with st.spinner("🤖 Running feature selection agent..."):
                     results = agent.run(X, y, progress_callback=progress_callback)
@@ -978,6 +1114,62 @@ def main():
                             top_features_df['Papers'] = top_features_df['paper_count']
                             st.dataframe(top_features_df[['feature_name', 'Evidence Score', 'Papers']], use_container_width=True)
                         
+                        # *** NEW: Detailed Article Listings for Each Feature ***
+                        st.subheader("📖 Detailed Article Listings")
+                        
+                        # Create tabs for each feature with articles
+                        features_with_articles = [r for r in literature_results if r.get('articles', [])]
+                        
+                        if features_with_articles:
+                            # Limit to top 10 features to avoid too many tabs
+                            features_to_show = sorted(features_with_articles, 
+                                                    key=lambda x: x['evidence_score'], 
+                                                    reverse=True)[:10]
+                            
+                            # Create tabs for each feature
+                            tab_labels = []
+                            tab_contents = []
+                            
+                            for feature_data in features_to_show:
+                                feature_name = feature_data['feature_name']
+                                articles = feature_data.get('articles', [])
+                                evidence_score = feature_data['evidence_score']
+                                
+                                # Create short tab label
+                                short_name = feature_name[:15] + "..." if len(feature_name) > 15 else feature_name
+                                tab_label = f"{short_name} ({evidence_score:.1f})"
+                                tab_labels.append(tab_label)
+                                
+                                # Store content for later
+                                tab_contents.append((feature_name, articles, feature_data))
+                            
+                            # Create tabs
+                            if tab_labels:
+                                tabs = st.tabs(tab_labels)
+                                
+                                for tab, (feature_name, articles, feature_data) in zip(tabs, tab_contents):
+                                    with tab:
+                                        # Feature header with stats
+                                        col1, col2, col3 = st.columns(3)
+                                        with col1:
+                                            st.metric("Evidence Score", f"{feature_data['evidence_score']:.1f}/5.0")
+                                        with col2:
+                                            st.metric("Total Papers", feature_data['paper_count'])
+                                        with col3:
+                                            st.metric("Articles Fetched", len(articles))
+                                        
+                                        # Search query used
+                                        if feature_data.get('search_query'):
+                                            st.info(f"**Search Query Used:** {feature_data['search_query']}")
+                                        
+                                        # Display articles
+                                        display_articles_for_feature(feature_name, articles)
+                        else:
+                            st.info("No articles were retrieved for the selected features. This could be due to:")
+                            st.markdown("- Features not being found in biomedical literature")
+                            st.markdown("- Search queries too specific")
+                            st.markdown("- Rate limiting preventing article fetch")
+                        
                         # Detailed literature table
                         with st.expander("📋 Detailed Literature Results"):
                             lit_df = pd.DataFrame([
@@ -985,6 +1177,7 @@ def main():
                                     'Feature': r['feature_name'],
                                     'Papers': r['paper_count'],
                                     'Evidence Score': f"{r['evidence_score']:.1f}/5.0",
+                                    'Articles Retrieved': len(r.get('articles', [])),
                                     'Support Level': '🔥 High' if r['evidence_score'] > 3.0 
                                                    else '📈 Medium' if r['evidence_score'] > 1.0 
                                                    else '❓ Low',
@@ -1003,6 +1196,11 @@ def main():
                         if lit_analysis['zero_evidence_features'] > lit_analysis['total_features'] * 0.5:
                             insights.append("⚠️ Many features lack literature support - consider domain expert review")
                         
+                        # Count features with articles
+                        features_with_articles_count = len([r for r in literature_results if r.get('articles', [])])
+                        if features_with_articles_count > 0:
+                            insights.append(f"📚 Retrieved detailed articles for {features_with_articles_count} features")
+                        
                         if insights:
                             st.success("**Literature Insights:**\n" + "\n".join(f"- {insight}" for insight in insights))
 
@@ -1015,7 +1213,7 @@ def main():
                     })
                     
                     # Add literature scores if available
-                    if enable_pubmed and literature_results:
+                    if enable_pubmed and 'literature_results' in locals():
                         lit_dict = {r['feature_name']: r['evidence_score'] for r in literature_results}
                         features_df['Literature Score'] = features_df['Feature'].map(lit_dict).fillna(0).round(1)
                     
@@ -1050,13 +1248,16 @@ def main():
                 with download_col1:
                     # Selected features CSV
                     features_download_df = pd.DataFrame({'selected_features': results['best_features']})
-                    if enable_pubmed and literature_results:
+                    if enable_pubmed and 'literature_results' in locals():
                         lit_dict = {r['feature_name']: r for r in literature_results}
                         features_download_df['literature_score'] = features_download_df['selected_features'].map(
                             lambda x: lit_dict.get(x, {}).get('evidence_score', 0)
                         )
                         features_download_df['paper_count'] = features_download_df['selected_features'].map(
                             lambda x: lit_dict.get(x, {}).get('paper_count', 0)
+                        )
+                        features_download_df['articles_retrieved'] = features_download_df['selected_features'].map(
+                            lambda x: len(lit_dict.get(x, {}).get('articles', []))
                         )
                     
                     features_csv = features_download_df.to_csv(index=False)
@@ -1074,7 +1275,7 @@ def main():
                         'best_features': results['best_features'],
                         'config': asdict(config),
                         'sense_info': sense_info,
-                        'literature_results': literature_results if enable_pubmed else []
+                        'literature_results': literature_results if enable_pubmed and 'literature_results' in locals() else []
                     }
                     results_json = json.dumps(download_results, indent=2)
                     st.download_button(
@@ -1085,8 +1286,8 @@ def main():
                     )
                 
                 with download_col3:
-                    if enable_pubmed and literature_results:
-                        # Literature report
+                    if enable_pubmed and 'literature_results' in locals():
+                        # Literature report with articles
                         lit_report = {
                             'analysis': lit_analysis,
                             'detailed_results': literature_results,
@@ -1114,9 +1315,14 @@ def main():
         👈 **To get started:**
         1. Upload your CSV from the left panel
         2. Select the target variable
-        3. **NEW**: Enable PubMed search and enter your email
-        4. Configure the settings
-        5. Click the "Start Feature Selection" button
+        3. Enable PubMed search and enter your email 
+        4. Enter API key for faster and better searches      
+            i-go to https://ncbi.nlm.nih.gov and register for a free 
+            account if you don't have one
+                
+            ii- get an API key from your account settings (optional)        
+        5. Configure the settings
+        6. Click the "Start Feature Selection" button
         
         📝 **Supported formats:**
         - CSV files
@@ -1128,6 +1334,7 @@ def main():
         - Evidence scoring based on publication count
         - Literature-informed agent decisions
         - Detailed publication analytics
+        - **NEW**: Full article listings with abstracts
         """)
         
         # Sample data option
@@ -1150,34 +1357,59 @@ def main():
                 st.success("✅ Sample data ready for download!")
         
         with col2:
-            if st.button("🍷 Load Wine Quality Dataset"):
+            if st.button("❤️ Load Heart Disease Dataset"):
                 try:
-                    # Create a synthetic wine quality dataset
+                    # Create a synthetic heart disease dataset
                     np.random.seed(42)
                     n_samples = 1000
                     
-                    wine_df = pd.DataFrame({
-                        'fixed_acidity': np.random.normal(8.3, 1.7, n_samples),
-                        'volatile_acidity': np.random.normal(0.5, 0.2, n_samples),
-                        'citric_acid': np.random.normal(0.25, 0.2, n_samples),
-                        'residual_sugar': np.random.normal(2.5, 1.4, n_samples),
-                        'chlorides': np.random.normal(0.09, 0.05, n_samples),
-                        'free_sulfur_dioxide': np.random.normal(15, 10, n_samples),
-                        'total_sulfur_dioxide': np.random.normal(46, 32, n_samples),
-                        'density': np.random.normal(0.997, 0.003, n_samples),
-                        'pH': np.random.normal(3.3, 0.15, n_samples),
-                        'sulphates': np.random.normal(0.66, 0.17, n_samples),
-                        'alcohol': np.random.normal(10.4, 1.1, n_samples),
+                    # Generate realistic heart disease features
+                    heart_df = pd.DataFrame({
+                        'age': np.random.randint(25, 80, n_samples),
+                        'sex': np.random.choice([0, 1], n_samples, p=[0.32, 0.68]),  # 0=female, 1=male
+                        'chest_pain_type': np.random.choice([0, 1, 2, 3], n_samples, p=[0.47, 0.17, 0.28, 0.08]),
+                        'resting_blood_pressure': np.random.normal(131, 17, n_samples).astype(int),
+                        'serum_cholesterol': np.random.normal(246, 51, n_samples).astype(int),
+                        'fasting_blood_sugar': np.random.choice([0, 1], n_samples, p=[0.85, 0.15]),  # >120mg/dl
+                        'resting_ecg_results': np.random.choice([0, 1, 2], n_samples, p=[0.48, 0.48, 0.04]),
+                        'max_heart_rate_achieved': np.random.normal(149, 22, n_samples).astype(int),
+                        'exercise_induced_angina': np.random.choice([0, 1], n_samples, p=[0.67, 0.33]),
+                        'st_depression': np.random.exponential(1.0, n_samples).round(1),
+                        'st_slope': np.random.choice([0, 1, 2], n_samples, p=[0.14, 0.46, 0.40]),
+                        'number_of_major_vessels': np.random.choice([0, 1, 2, 3], n_samples, p=[0.54, 0.21, 0.16, 0.09]),
+                        'thalassemia_type': np.random.choice([1, 2, 3], n_samples, p=[0.05, 0.18, 0.77]),
                     })
                     
-                    # Create quality target (3-8 scale)
-                    wine_df['quality'] = np.random.choice([3, 4, 5, 6, 7, 8], n_samples, p=[0.05, 0.15, 0.35, 0.30, 0.12, 0.03])
+                    # Ensure realistic ranges
+                    heart_df['resting_blood_pressure'] = np.clip(heart_df['resting_blood_pressure'], 94, 200)
+                    heart_df['serum_cholesterol'] = np.clip(heart_df['serum_cholesterol'], 126, 564)
+                    heart_df['max_heart_rate_achieved'] = np.clip(heart_df['max_heart_rate_achieved'], 71, 202)
+                    heart_df['st_depression'] = np.clip(heart_df['st_depression'], 0.0, 6.2)
                     
-                    csv = wine_df.to_csv(index=False)
+                    # Create target variable (0=no disease, 1=disease) with realistic correlations
+                    # Higher risk factors increase probability of heart disease
+                    risk_score = (
+                        (heart_df['age'] - 25) / 55 * 0.3 +
+                        heart_df['sex'] * 0.4 +  # males higher risk
+                        (heart_df['chest_pain_type'] == 0) * 0.3 +  # typical angina
+                        (heart_df['resting_blood_pressure'] - 94) / 106 * 0.2 +
+                        (heart_df['serum_cholesterol'] - 126) / 438 * 0.15 +
+                        heart_df['fasting_blood_sugar'] * 0.1 +
+                        heart_df['exercise_induced_angina'] * 0.4 +
+                        heart_df['st_depression'] / 6.2 * 0.3 +
+                        (heart_df['number_of_major_vessels'] / 3) * 0.5 +
+                        (heart_df['thalassemia_type'] == 3) * 0.2
+                    )
+                    
+                    # Convert risk score to probability and generate target
+                    prob_disease = 1 / (1 + np.exp(-(risk_score - 1.8)))  # sigmoid function
+                    heart_df['target'] = np.random.binomial(1, prob_disease, n_samples)
+                    
+                    csv = heart_df.to_csv(index=False)
                     st.download_button(
-                        label="📥 Download Wine Quality Sample",
+                        label="📥 Download Heart Disease Sample",
                         data=csv,
-                        file_name="sample_wine_quality.csv",
+                        file_name="sample_heart_disease.csv",
                         mime="text/csv"
                     )
                     st.success("✅ Sample data ready for download!")
@@ -1198,6 +1430,7 @@ def main():
         - Automatic PubMed search for each selected feature
         - Evidence scores based on publication count and relevance
         - Literature-informed agent decisions
+        - **NEW**: Detailed article listings with titles, authors, abstracts, and PubMed links
         - Downloadable publication analysis reports
         """)
 
