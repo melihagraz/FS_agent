@@ -1496,7 +1496,7 @@ def main():
                 st.success("✅ Sample data ready for download!")
         
         with col2:
-            if st.button("❤️ Load Heart Disease Dataset"):
+            if st.button("❤️ Load Heart Disease Dataset!!"):
                 try:
                     # Create a synthetic heart disease dataset
 
@@ -1533,3 +1533,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
