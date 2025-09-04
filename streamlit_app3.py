@@ -61,6 +61,206 @@ class SimplePubMedSearcher:
             time.sleep(self.delay - time_since_last)
         self.last_request = time.time()
     
+    def fetch_article_details(self, pmids: List[str]) -> List[dict]:
+        """Fetch article details from PubMed IDs"""
+        if not pmids:
+            return []
+        
+        # Check cache first
+        articles = []
+        pmids_to_fetch = []
+        for pmid in pmids:
+            if pmid in self.article_cache:
+                articles.append(self.article_cache[pmid])
+            else:
+                pmids_to_fetch.append(pmid)
+        
+        if not pmids_to_fetch:
+            return articles
+        
+        self._rate_limit()
+        
+        try:
+            # Fetch article details using efetch
+            fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+            params = {
+                'db': 'pubmed',
+                'id': ','.join(pmids_to_fetch),
+                'retmode': 'xml',
+                'email': self.email,
+                'tool': 'FeatureSelectionAgent'
+            }
+            
+            if self.api_key:
+                params['api_key'] = self.api_key
+            
+            response = requests.get(fetch_url, params=params, timeout=15)
+            root = ET.fromstring(response.content)
+            
+            # Parse each article
+            for article_elem in root.findall('.//PubmedArticle'):
+                article_info = self._parse_article(article_elem)
+                if article_info:
+                    articles.append(article_info)
+                    self.article_cache[article_info['pmid']] = article_info
+            
+        except Exception as e:
+            st.warning(f"Error fetching article details: {str(e)}")
+        
+        return articles
+    
+    def _parse_article(self, article_elem) -> dict:
+        """Parse article XML element"""
+        try:
+            # Extract PMID
+            pmid_elem = article_elem.find('.//PMID')
+            pmid = pmid_elem.text if pmid_elem is not None else "Unknown"
+            
+            # Extract title
+            title_elem = article_elem.find('.//ArticleTitle')
+            title = title_elem.text if title_elem is not None else "No title"
+            
+            # Extract authors
+            authors = []
+            for author in article_elem.findall('.//Author'):
+                last_name = author.find('LastName')
+                fore_name = author.find('ForeName')
+                if last_name is not None:
+                    author_name = last_name.text
+                    if fore_name is not None:
+                        author_name = f"{author_name} {fore_name.text[0]}"
+                    authors.append(author_name)
+            authors_str = ", ".join(authors[:3])
+            if len(authors) > 3:
+                authors_str += " et al."
+            
+            # Extract journal
+            journal_elem = article_elem.find('.//Journal/Title')
+            journal = journal_elem.text if journal_elem is not None else "Unknown Journal"
+            
+            # Extract year
+            year_elem = article_elem.find('.//PubDate/Year')
+            year = year_elem.text if year_elem is not None else "Unknown"
+            
+            # Extract abstract
+            abstract_elem = article_elem.find('.//AbstractText')
+            abstract = abstract_elem.text if abstract_elem is not None else "No abstract available"
+            if len(abstract) > 300:
+                abstract = abstract[:297] + "..."
+            
+            return {
+                'pmid': pmid,
+                'title': title,
+                'authors': authors_str,
+                'journal': journal,
+                'year': year,
+                'abstract': abstract,
+                'url': f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+            }
+        except Exception:
+            return None
+    
+    def search_simple(self, feature_name: str, disease_context: str = None, max_results: int = 5) -> dict:
+        """Enhanced PubMed search with article details"""
+        cache_key = f"{feature_name}_{disease_context}_{max_results}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+        
+        # Rate limiting
+        self._rate_limit()
+        
+        try:
+            # Build search query
+            query_parts = [f'"{feature_name}"']
+            if disease_context:
+                query_parts.append(f'"{disease_context}"')
+            query_parts.extend(["biomarker", "expression", "association"])
+            search_term = " AND ".join(query_parts)
+            
+            # PubMed E-utilities search
+            search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+            params = {
+                'db': 'pubmed',
+                'term': search_term,
+                'retmax': max_results,
+                'email': self.email,
+                'tool': 'FeatureSelectionAgent',
+                'sort': 'relevance'
+            }
+            
+            if self.api_key:
+                params['api_key'] = self.api_key
+            
+            response = requests.get(search_url, params=params, timeout=10)
+            root = ET.fromstring(response.content)
+            
+            # Extract IDs and count
+            ids = [id_elem.text for id_elem in root.findall('.//Id')]
+            count_elem = root.find('.//Count')
+            count = int(count_elem.text) if count_elem is not None else 0
+            
+            # Calculate evidence score (0-5 scale)
+            evidence_score = min(count / 20.0, 5.0)
+            if disease_context and count > 0:
+                evidence_score *= 1.2  # Bonus for disease context
+            
+            # Fetch article details for top results
+            articles = self.fetch_article_details(ids[:5]) if ids else []
+            
+            result = {
+                'feature_name': feature_name,
+                'paper_count': count,
+                'sample_ids': ids[:5],
+                'articles': articles,  # Now includes full article details
+                'evidence_score': round(evidence_score, 1),
+                'search_query': search_term,
+                'disease_context': disease_context
+            }
+            
+            self.cache[cache_key] = result
+            return result
+            
+        except Exception as e:
+            st.warning(f"PubMed search error for {feature_name}: {str(e)}")
+            return {
+                'feature_name': feature_name,
+                'paper_count': 0,
+                'sample_ids': [],
+                'articles': [],
+                'evidence_score': 0.0,
+                'search_query': '',
+                'disease_context': disease_context
+            }
+    
+    def batch_search(self, features: List[str], disease_context: str = None, 
+                    progress_callback=None) -> List[dict]:
+        """Batch search for multiple features"""
+        results = []
+        total = len(features)
+        
+        for i, feature in enumerate(features):
+            if progress_callback:
+                progress_callback(i + 1, total, feature)
+            
+            result = self.search_simple(feature, disease_context)
+            results.append(result)
+    """Enhanced PubMed searcher with rate limiting and article fetching"""
+    
+    def __init__(self, email: str, api_key: Optional[str] = None, delay: float = 0.34):
+        self.email = email
+        self.api_key = api_key
+        self.delay = delay if not api_key else 0.1  # Faster with API key
+        self.last_request = 0
+        self.cache = {}
+        self.article_cache = {}  # Cache for article details
+    
+    def _rate_limit(self):
+        """Apply rate limiting between requests"""
+        time_since_last = time.time() - self.last_request
+        if time_since_last < self.delay:
+            time.sleep(self.delay - time_since_last)
+        self.last_request = time.time()
+    
 def generate_heart_df(n_samples=1000, seed=42, add_missing=True):
     rng = np.random.default_rng(seed)
 
@@ -1496,7 +1696,7 @@ def main():
                 st.success("✅ Sample data ready for download!")
         
         with col2:
-            if st.button("❤️ Load Heart Disease Dataset!!"):
+            if st.button("❤️ Load Heart Disease Dataset"):
                 try:
                     # Create a synthetic heart disease dataset
 
@@ -1533,4 +1733,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
