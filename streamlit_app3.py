@@ -172,7 +172,6 @@ def generate_heart_df(n_samples=1000, seed=42, add_missing=True):
     if add_missing:
         miss_mask = rng.random(n_samples) < 0.02
         serum_cholesterol = serum_cholesterol.astype('float')
-        serum_cholesterol[miss_mask] = np.nan
         bp_out_mask = rng.random(n_samples) < 0.01
         resting_blood_pressure[bp_out_mask] = np.clip(resting_blood_pressure[bp_out_mask] + rng.integers(30, 60, bp_out_mask.sum()), 120, 260)
 
@@ -1497,7 +1496,7 @@ def main():
                 st.success("✅ Sample data ready for download!")
         
         with col2:
-            if st.button("❤️ Load Heart Disease Dataset!"):
+            if st.button("❤️ Load Heart Disease Dataset"):
                 try:
                     # Create a synthetic heart disease dataset
 
